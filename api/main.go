@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/dumbresi/Healthcare-Plan-Management/api/config"
+	"github.com/dumbresi/Healthcare-Plan-Management/api/routes"
 	"github.com/gofiber/fiber/v2"
 )
 
