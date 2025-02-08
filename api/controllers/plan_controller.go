@@ -46,41 +46,30 @@ func CreatePlan(c *fiber.Ctx) error {
 }
 
 func GetPlan(c *fiber.Ctx) error {
-	id := c.Params("id")
-	
-	// Get ETag from request header
-	requestETag := c.Get("ETag")
-	if requestETag == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ETag header is required"})
-	}
+    id := c.Params("id")
+    
+    // Get the stored ETag
+    storedETag, err := config.RedisClient.Get(ctx, id+":etag").Result()
+    if err != nil {
+        return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
+    }
 
-	// Get the stored ETag for validation
-	storedETag, err := config.RedisClient.Get(ctx, id+":etag").Result()
-	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
-	}
+    // Check If-None-Match header for conditional read
+    if ifNoneMatch := c.Get("If-None-Match"); ifNoneMatch != "" && ifNoneMatch == storedETag {
+        return c.SendStatus(fiber.StatusNotModified)
+    }
 
-	// Verify if the provided ETag matches the stored one
-	if requestETag != storedETag {
-		return c.Status(fiber.StatusPreconditionFailed).JSON(fiber.Map{"error": "ETag mismatch"})
-	}
+    val, err := config.RedisClient.Get(ctx, id).Result()
+    if err != nil {
+        return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
+    }
 
-	// Check If-None-Match header for conditional read
-	if ifNoneMatch := c.Get("If-None-Match"); ifNoneMatch == storedETag {
-		return c.SendStatus(fiber.StatusNotModified)
-	}
+    var plan models.Plan
+    json.Unmarshal([]byte(val), &plan)
 
-	val, err := config.RedisClient.Get(ctx, id).Result()
-	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
-	}
-
-	var plan models.Plan
-	json.Unmarshal([]byte(val), &plan)
-
-	// Set ETag in response header
-	c.Set("ETag", storedETag)
-	return c.Status(fiber.StatusOK).JSON(plan)
+    // Set ETag in response header
+    c.Set("ETag", storedETag)
+    return c.Status(fiber.StatusOK).JSON(plan)
 }
 
 func DeletePlan(c *fiber.Ctx) error {
