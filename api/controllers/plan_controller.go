@@ -3,9 +3,11 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+
 	"github.com/dumbresi/Healthcare-Plan-Management/api/config"
 	"github.com/dumbresi/Healthcare-Plan-Management/api/models"
-	"github.com/dumbresi/Healthcare-Plan-Management/api/utils"
+	// "github.com/dumbresi/Healthcare-Plan-Management/api/utils"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -21,8 +23,10 @@ func CreatePlan(c *fiber.Ctx) error {
 	}
 
 	// Validate JSON schema
-	valid, err := utils.ValidateJSON(plan, "schemas/plan_schema.json")
-	if err != nil || !valid {
+	// valid, err := utils.ValidateJSON(plan, "schemas/plan_schema.json")
+	_, err = json.Marshal(plan)
+	fmt.Println(err)
+	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid JSON structure"})
 	}
 
