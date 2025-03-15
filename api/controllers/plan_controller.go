@@ -73,6 +73,13 @@ func CreatePlan(c *fiber.Ctx) error {
 	}
 
 	// ... existing code ...
+	exists, err := config.RedisClient.Exists(ctx, plan.ObjectId).Result()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check plan existence"})
+	}
+	if exists == 1 {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Plan already exists"})
+	}
 
 	planJSON, _ := json.Marshal(plan)
 
@@ -125,8 +132,18 @@ func GetPlan(c *fiber.Ctx) error {
 
 func DeletePlan(c *fiber.Ctx) error {
 	id := c.Params("id")
-	err := config.RedisClient.Del(ctx, id).Err()
+	
+	// Check if plan exists before deleting
+	exists, err := config.RedisClient.Exists(ctx, id).Result()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check plan existence"})
+	}
+	if exists == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
+	}
 
+	// Delete both the plan and its etag
+	err = config.RedisClient.Del(ctx, id, id+":etag").Err()
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete plan"})
 	}
