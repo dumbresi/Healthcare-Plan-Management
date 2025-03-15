@@ -132,46 +132,52 @@ func DeletePlan(c *fiber.Ctx) error {
 
 func PatchPlan(c *fiber.Ctx) error {
 	id := c.Params("id")
-	
-	// Get existing plan
+
+	// Get existing plan data from Redis
 	val, err := config.RedisClient.Get(ctx, id).Result()
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
 	}
-	
+
 	// Get stored ETag
 	storedETag, err := config.RedisClient.Get(ctx, id+":etag").Result()
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve ETag"})
 	}
-	
+
 	// Check If-Match header for conditional update
 	if ifMatch := c.Get("If-Match"); ifMatch != "" && ifMatch != storedETag {
 		return c.Status(fiber.StatusPreconditionFailed).JSON(fiber.Map{"error": "Plan has been modified"})
 	}
-	
+
+	// Unmarshal the existing plan
 	var existingPlan models.Plan
-	json.Unmarshal([]byte(val), &existingPlan)
-	
-	// Parse update data
+	if err := json.Unmarshal([]byte(val), &existingPlan); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse existing plan"})
+	}
+
+	// Parse update data from request body
 	var updatePlan models.Plan
 	if err := c.BodyParser(&updatePlan); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request format"})
 	}
-	
-	// Validate ObjectId if provided
+
+	// Validate that the provided ObjectId (if any) matches the existing plan
 	if updatePlan.ObjectId != "" && existingPlan.ObjectId != updatePlan.ObjectId {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ObjectId mismatch in plan"})
 	}
-	
+
 	// Update PlanCostShares if provided
 	if updatePlan.PlanCostShares != nil {
 		if existingPlan.PlanCostShares != nil {
-			if existingPlan.PlanCostShares.ObjectId != updatePlan.PlanCostShares.ObjectId {
+			// Validate ObjectId for PlanCostShares if provided
+			if updatePlan.PlanCostShares.ObjectId != "" && existingPlan.PlanCostShares.ObjectId != updatePlan.PlanCostShares.ObjectId {
 				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ObjectId mismatch in planCostShares"})
 			}
-			
-			// Update individual fields
+
+			// Update individual fields.
+			// Note: Using non-pointer ints means you cannot update to zero.
+			// Consider using *int in an update-specific struct if zero is a valid value.
 			if updatePlan.PlanCostShares.Deductible != 0 {
 				existingPlan.PlanCostShares.Deductible = updatePlan.PlanCostShares.Deductible
 			}
@@ -184,89 +190,103 @@ func PatchPlan(c *fiber.Ctx) error {
 			if updatePlan.PlanCostShares.Org != "" {
 				existingPlan.PlanCostShares.Org = updatePlan.PlanCostShares.Org
 			}
-			
-			// Store the updated PlanCostShares
-			costSharesJSON, _ := json.Marshal(existingPlan.PlanCostShares)
-			err = config.RedisClient.Set(ctx, existingPlan.PlanCostShares.ObjectId, costSharesJSON, 0).Err()
+
+			// Marshal and store the updated PlanCostShares
+			costSharesJSON, err := json.Marshal(existingPlan.PlanCostShares)
 			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal updated PlanCostShares"})
+			}
+			if err := config.RedisClient.Set(ctx, existingPlan.PlanCostShares.ObjectId, costSharesJSON, 0).Err(); err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update PlanCostShares"})
 			}
 		} else {
-			// If no existing PlanCostShares, use the new one
+			// No existing PlanCostShares; assign the new one and store it.
 			existingPlan.PlanCostShares = updatePlan.PlanCostShares
-			costSharesJSON, _ := json.Marshal(existingPlan.PlanCostShares)
-			err = config.RedisClient.Set(ctx, existingPlan.PlanCostShares.ObjectId, costSharesJSON, 0).Err()
+			costSharesJSON, err := json.Marshal(existingPlan.PlanCostShares)
 			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal new PlanCostShares"})
+			}
+			if err := config.RedisClient.Set(ctx, existingPlan.PlanCostShares.ObjectId, costSharesJSON, 0).Err(); err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store PlanCostShares"})
 			}
 		}
 	}
-	
-	// Handle LinkedPlanServices updates if provided
+
+	// Handle updates for LinkedPlanServices if provided
 	if len(updatePlan.LinkedPlanServices) > 0 {
-		// Create a map of new LinkedPlanServices for easy lookup
-		newLinkedPlanServices := make(map[string]models.LinkedPlanService)
+		// Create a map for new LinkedPlanServices for easier lookup by ObjectId
+		newServicesMap := make(map[string]models.LinkedPlanService)
 		for _, newService := range updatePlan.LinkedPlanServices {
-			newLinkedPlanServices[newService.ObjectId] = newService
+			newServicesMap[newService.ObjectId] = newService
 		}
-		
-		// Update existing LinkedPlanServices if they are in the newLinkedPlanServices map
+
+		// Update existing LinkedPlanServices if found in new update
 		for i, existingService := range existingPlan.LinkedPlanServices {
-			if newService, ok := newLinkedPlanServices[existingService.ObjectId]; ok {
+			if newService, ok := newServicesMap[existingService.ObjectId]; ok {
 				existingPlan.LinkedPlanServices[i] = newService
-				delete(newLinkedPlanServices, existingService.ObjectId)
-				
-				// Store the updated LinkedPlanService
-				serviceJSON, _ := json.Marshal(newService)
-				err = config.RedisClient.Set(ctx, newService.ObjectId, serviceJSON, 0).Err()
+				delete(newServicesMap, existingService.ObjectId)
+
+				// Store updated LinkedPlanService
+				serviceJSON, err := json.Marshal(newService)
 				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal updated LinkedPlanService"})
+				}
+				if err := config.RedisClient.Set(ctx, newService.ObjectId, serviceJSON, 0).Err(); err != nil {
 					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update LinkedPlanService"})
 				}
-				
+
 				// Store LinkedService component
-				linkedServiceJSON, _ := json.Marshal(newService.LinkedService)
-				err = config.RedisClient.Set(ctx, newService.LinkedService.ObjectId, linkedServiceJSON, 0).Err()
+				linkedServiceJSON, err := json.Marshal(newService.LinkedService)
 				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal updated LinkedService"})
+				}
+				if err := config.RedisClient.Set(ctx, newService.LinkedService.ObjectId, linkedServiceJSON, 0).Err(); err != nil {
 					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update LinkedService"})
 				}
-				
+
 				// Store PlanServiceCostShares component
-				costSharesJSON, _ := json.Marshal(newService.PlanServiceCostShares)
-				err = config.RedisClient.Set(ctx, newService.PlanServiceCostShares.ObjectId, costSharesJSON, 0).Err()
+				costSharesJSON, err := json.Marshal(newService.PlanServiceCostShares)
 				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal updated PlanServiceCostShares"})
+				}
+				if err := config.RedisClient.Set(ctx, newService.PlanServiceCostShares.ObjectId, costSharesJSON, 0).Err(); err != nil {
 					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update PlanServiceCostShares"})
 				}
 			}
 		}
-		
-		// Append any remaining new LinkedPlanServices that were not in the existing plan
-		for _, newService := range newLinkedPlanServices {
+
+		// Append any new LinkedPlanServices that did not match existing ones
+		for _, newService := range newServicesMap {
 			existingPlan.LinkedPlanServices = append(existingPlan.LinkedPlanServices, newService)
-			
-			// Store the new LinkedPlanService
-			serviceJSON, _ := json.Marshal(newService)
-			err = config.RedisClient.Set(ctx, newService.ObjectId, serviceJSON, 0).Err()
+
+			// Store the new LinkedPlanService and its components
+			serviceJSON, err := json.Marshal(newService)
 			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal new LinkedPlanService"})
+			}
+			if err := config.RedisClient.Set(ctx, newService.ObjectId, serviceJSON, 0).Err(); err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store LinkedPlanService"})
 			}
-			
-			// Store LinkedService component
-			linkedServiceJSON, _ := json.Marshal(newService.LinkedService)
-			err = config.RedisClient.Set(ctx, newService.LinkedService.ObjectId, linkedServiceJSON, 0).Err()
+
+			linkedServiceJSON, err := json.Marshal(newService.LinkedService)
 			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal new LinkedService"})
+			}
+			if err := config.RedisClient.Set(ctx, newService.LinkedService.ObjectId, linkedServiceJSON, 0).Err(); err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store LinkedService"})
 			}
-			
-			// Store PlanServiceCostShares component
-			costSharesJSON, _ := json.Marshal(newService.PlanServiceCostShares)
-			err = config.RedisClient.Set(ctx, newService.PlanServiceCostShares.ObjectId, costSharesJSON, 0).Err()
+
+			costSharesJSON, err := json.Marshal(newService.PlanServiceCostShares)
 			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal new PlanServiceCostShares"})
+			}
+			if err := config.RedisClient.Set(ctx, newService.PlanServiceCostShares.ObjectId, costSharesJSON, 0).Err(); err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store PlanServiceCostShares"})
 			}
 		}
 	}
-	
-	// Update other fields
+
+	// Update other simple fields if provided
 	if updatePlan.CreationDate != "" {
 		existingPlan.CreationDate = updatePlan.CreationDate
 	}
@@ -276,23 +296,24 @@ func PatchPlan(c *fiber.Ctx) error {
 	if updatePlan.Org != "" {
 		existingPlan.Org = updatePlan.Org
 	}
-	
-	// Generate new JSON and ETag
-	planJSON, _ := json.Marshal(existingPlan)
-	newETag := fmt.Sprintf("\"%x\"", sha256.Sum256(planJSON))
-	
-	// Store updated plan and ETag
-	err = config.RedisClient.Set(ctx, id, planJSON, 0).Err()
+
+	// Generate new JSON for the updated plan and create a new ETag
+	planJSON, err := json.Marshal(existingPlan)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update data"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to marshal updated plan"})
 	}
-	
-	err = config.RedisClient.Set(ctx, id+":etag", newETag, 0).Err()
-	if err != nil {
+	newETag := fmt.Sprintf("\"%x\"", sha256.Sum256(planJSON))
+
+	// Store updated plan and new ETag in Redis
+	if err := config.RedisClient.Set(ctx, id, planJSON, 0).Err(); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update plan data"})
+	}
+	if err := config.RedisClient.Set(ctx, id+":etag", newETag, 0).Err(); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update ETag"})
 	}
-	
-	// Set new ETag in response header
+
+	// Set new ETag in response header and return the updated plan
 	c.Set("ETag", newETag)
 	return c.Status(fiber.StatusOK).JSON(existingPlan)
 }
+
