@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/dumbresi/Healthcare-Plan-Management/api/config"
 	"github.com/dumbresi/Healthcare-Plan-Management/api/models"
+	"github.com/dumbresi/Healthcare-Plan-Management/api/rabbitmq"
 	"github.com/redis/go-redis/v9"
 
 	// "github.com/dumbresi/Healthcare-Plan-Management/api/utils"
@@ -67,41 +69,135 @@ func GetAllPlans(c *fiber.Ctx) error {
 func CreatePlan(c *fiber.Ctx) error {
 	var plan models.Plan
 
-	err := c.BodyParser(&plan)
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request format"})
+	// Step 1: Parse JSON from request body
+	if err := c.BodyParser(&plan); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Invalid JSON format",
+			"details": err.Error(),
+		})
 	}
 
-	// ... existing code ...
+	// Step 2: Basic Validation
+	if plan.ObjectId == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Validation failed",
+			"field":   "objectId",
+			"message": "ObjectId is required",
+		})
+	}
+	if plan.PlanCostShares == nil || plan.PlanCostShares.ObjectId == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Validation failed",
+			"field":   "planCostShares.objectId",
+			"message": "PlanCostShares and its ObjectId are required",
+		})
+	}
+	if len(plan.LinkedPlanServices) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Validation failed",
+			"field":   "linkedPlanServices",
+			"message": "At least one LinkedPlanService is required",
+		})
+	}
+	for i, service := range plan.LinkedPlanServices {
+		if service.ObjectId == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error":   "Validation failed",
+				"field":   fmt.Sprintf("linkedPlanServices[%d].objectId", i),
+				"message": "LinkedPlanService ObjectId is required",
+			})
+		}
+		if service.LinkedService.ObjectId == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error":   "Validation failed",
+				"field":   fmt.Sprintf("linkedPlanServices[%d].linkedService.objectId", i),
+				"message": "LinkedService ObjectId is required",
+			})
+		}
+		if service.PlanServiceCostShares.ObjectId == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error":   "Validation failed",
+				"field":   fmt.Sprintf("linkedPlanServices[%d].planserviceCostShares.objectId", i),
+				"message": "PlanServiceCostShares ObjectId is required",
+			})
+		}
+	}
+
+	// Step 3: Check if plan already exists
 	exists, err := config.RedisClient.Exists(ctx, plan.ObjectId).Result()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check plan existence"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "Failed to check plan existence",
+			"details": err.Error(),
+		})
 	}
 	if exists == 1 {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Plan already exists"})
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":    "Plan already exists",
+			"objectId": plan.ObjectId,
+		})
 	}
 
-	planJSON, _ := json.Marshal(plan)
+	// Step 4: Marshal full plan and subcomponents with error debug logs
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		log.Printf("Failed to marshal full plan: %v", err)
 
-	// Generate ETag (using simple hash of JSON)
+		if plan.PlanCostShares != nil {
+			if _, err2 := json.Marshal(plan.PlanCostShares); err2 != nil {
+				log.Printf("Failed to marshal PlanCostShares: %v", err2)
+			}
+		}
+
+		for i, lps := range plan.LinkedPlanServices {
+			if _, err := json.Marshal(lps); err != nil {
+				log.Printf("Failed to marshal LinkedPlanService[%d]: %v", i, err)
+			}
+			if _, err := json.Marshal(lps.LinkedService); err != nil {
+				log.Printf("Failed to marshal LinkedService[%d]: %v", i, err)
+			}
+			if _, err := json.Marshal(lps.PlanServiceCostShares); err != nil {
+				log.Printf("Failed to marshal PlanServiceCostShares[%d]: %v", i, err)
+			}
+		}
+
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Failed to marshal plan object",
+			"details": err.Error(),
+		})
+	}
+
+	// Step 5: Generate ETag from hash
 	etag := fmt.Sprintf("\"%x\"", sha256.Sum256(planJSON))
 
-	// Store both plan and its ETag
-	err = config.RedisClient.Set(ctx, plan.ObjectId, planJSON, 0).Err()
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store data"})
+	// Step 6: Store plan and ETag in Redis
+	if err := config.RedisClient.Set(ctx, plan.ObjectId, planJSON, 0).Err(); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store plan in Redis"})
 	}
-
-	// Store ETag separately
-	err = config.RedisClient.Set(ctx, plan.ObjectId+":etag", etag, 0).Err()
-	if err != nil {
+	if err := config.RedisClient.Set(ctx, plan.ObjectId+":etag", etag, 0).Err(); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store ETag"})
 	}
 
-	// Set ETag in response header
+	// Step 7: Set ETag in response header
 	c.Set("ETag", etag)
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "Plan created successfully"})
+
+	msg := models.PlanMessage{
+		Operation: "create",
+		Plan:      plan,
+	}
+	rmq := &rabbitmq.Factory{}
+	if err := rmq.PublishMessage("plans_queue", msg); err != nil {
+	log.Printf("Failed to publish RabbitMQ message: %v", err)
+	// Don't fail the request, but log it (or return 202 Accepted if you want async behavior)
+	}
+
+	// Step 8: Respond success
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"message":  "Plan created successfully",
+		"objectId": plan.ObjectId,
+	})
 }
+
 
 func GetPlan(c *fiber.Ctx) error {
 	id := c.Params("id")
@@ -132,14 +228,31 @@ func GetPlan(c *fiber.Ctx) error {
 
 func DeletePlan(c *fiber.Ctx) error {
 	id := c.Params("id")
-	
+
 	// Check if plan exists before deleting
 	exists, err := config.RedisClient.Exists(ctx, id).Result()
+	
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check plan existence"})
 	}
 	if exists == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
+	}
+
+	// Load the plan so we can publish it
+	val, err := config.RedisClient.Get(ctx, id).Result()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch plan before deletion",
+		})
+	}
+
+	var plan models.Plan
+	if err := json.Unmarshal([]byte(val), &plan); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "Failed to unmarshal stored plan",
+			"details": err.Error(),
+		})
 	}
 
 	// Delete both the plan and its etag
@@ -148,6 +261,17 @@ func DeletePlan(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete plan"})
 	}
 
+	// Publish delete message to RabbitMQ
+	msg := models.PlanMessage{
+		Operation: "delete",
+		Plan:      plan,
+	}
+	rmq := &rabbitmq.Factory{}
+	if err := rmq.PublishMessage("plans_queue", msg); err != nil {
+		log.Printf("Failed to publish delete message: %v", err)
+		// You can return 202 if you want to treat RabbitMQ as async
+	}
+	
 	return c.Status(fiber.StatusNoContent).JSON(fiber.Map{"message": "Plan deleted successfully"})
 }
 
@@ -178,7 +302,7 @@ func PatchPlan(c *fiber.Ctx) error {
 	if ifMatch == "" {
 		return c.Status(fiber.StatusPreconditionRequired).JSON(fiber.Map{"error": "If-Match header is required"})
 	}
-	if ifMatch != storedETag && ifMatch!="\""+storedETag+"\"" {
+	if ifMatch != storedETag && ifMatch != "\""+storedETag+"\"" {
 		return c.Status(fiber.StatusPreconditionFailed).JSON(fiber.Map{"error": "Plan has been modified, update aborted"})
 	}
 
@@ -268,5 +392,16 @@ func PatchPlan(c *fiber.Ctx) error {
 
 	// Return updated plan with new ETag
 	c.Set("ETag", newETag)
+
+	msg := models.PlanMessage{
+		Operation: "patch",
+		Plan:      existingPlan,
+	}
+	
+	rmq := &rabbitmq.Factory{}
+	if err := rmq.PublishMessage("plans_queue", msg); err != nil {
+		log.Printf("Failed to publish patch message: %v", err)
+	}
+
 	return c.Status(fiber.StatusOK).JSON(existingPlan)
 }

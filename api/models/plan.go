@@ -6,6 +6,11 @@ type PlanMessage struct {
 	Plan      Plan   `json:"plan"`
 }
 
+type SearchPlanRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 type Plan struct {
 	PlanCostShares     *PlanCostShares     `json:"planCostShares" binding:"required"`
 	LinkedPlanServices []LinkedPlanService `json:"linkedPlanServices" binding:"required"`
