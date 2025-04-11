@@ -1,5 +1,11 @@
 package models
 
+
+type PlanMessage struct {
+	Operation string `json:"operation"`
+	Plan      Plan   `json:"plan"`
+}
+
 type Plan struct {
 	PlanCostShares     *PlanCostShares     `json:"planCostShares" binding:"required"`
 	LinkedPlanServices []LinkedPlanService `json:"linkedPlanServices" binding:"required"`
@@ -7,6 +13,7 @@ type Plan struct {
 	ObjectId           string              `json:"objectId" binding:"required"`
 	ObjectType         string              `json:"objectType" binding:"required"`
 	Org                string              `json:"_org" binding:"required"`
+	PlanJoin           map[string]interface{} `json:"plan_join,omitempty"`
 }
 
 type PlanCostShares struct {
@@ -15,6 +22,7 @@ type PlanCostShares struct {
 	ObjectId   string `json:"objectId" binding:"required"`
 	ObjectType string `json:"objectType" binding:"required"`
 	Org        string `json:"_org" binding:"required"`
+	PlanJoin           map[string]interface{} `json:"plan_join,omitempty"`
 }
 
 type LinkedService struct {
@@ -22,6 +30,7 @@ type LinkedService struct {
 	ObjectId   string `json:"objectId" binding:"required"`
 	ObjectType string `json:"objectType" binding:"required"`
 	Org        string `json:"_org" binding:"required"`
+	PlanJoin           map[string]interface{} `json:"plan_join,omitempty"`
 }
 
 type PlanServiceCostShares struct {
@@ -30,6 +39,7 @@ type PlanServiceCostShares struct {
 	ObjectId   string `json:"objectId" binding:"required"`
 	ObjectType string `json:"objectType" binding:"required"`
 	Org        string `json:"_org" binding:"required"`
+	PlanJoin           map[string]interface{} `json:"plan_join,omitempty"`
 }
 
 type LinkedPlanService struct {
@@ -38,4 +48,5 @@ type LinkedPlanService struct {
 	ObjectId              string               `json:"objectId" binding:"required"`
 	ObjectType            string               `json:"objectType" binding:"required"`
 	Org                   string               `json:"_org" binding:"required"`
+	PlanJoin           map[string]interface{} `json:"plan_join,omitempty"`
 }
