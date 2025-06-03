@@ -4,11 +4,11 @@ go 1.23.1
 
 require (
 	github.com/elastic/go-elasticsearch/v8 v8.17.1
-	github.com/gofiber/fiber/v2 v2.52.6
-	github.com/golang-jwt/jwt/v4 v4.5.1
+	github.com/gofiber/fiber/v2 v2.52.7
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/joho/godotenv v1.5.1
 	github.com/rabbitmq/amqp091-go v1.10.0
-	github.com/redis/go-redis/v9 v9.7.0
+	github.com/redis/go-redis/v9 v9.7.3
 	github.com/xeipuuv/gojsonschema v1.2.0
 )
 

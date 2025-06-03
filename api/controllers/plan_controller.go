@@ -227,52 +227,91 @@ func GetPlan(c *fiber.Ctx) error {
 }
 
 func DeletePlan(c *fiber.Ctx) error {
-	id := c.Params("id")
+    id := c.Params("id")
 
-	// Check if plan exists before deleting
-	exists, err := config.RedisClient.Exists(ctx, id).Result()
-	
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check plan existence"})
-	}
-	if exists == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
-	}
+    // Check if plan exists and get the plan data
+    val, err := config.RedisClient.Get(ctx, id).Result()
+    if err == redis.Nil {
+        return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Plan not found"})
+    } else if err != nil {
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+            "error": "Failed to fetch plan",
+            "details": err.Error(),
+        })
+    }
 
-	// Load the plan so we can publish it
-	val, err := config.RedisClient.Get(ctx, id).Result()
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to fetch plan before deletion",
-		})
-	}
+    // Unmarshal the plan to get child object IDs
+    var plan models.Plan
+    if err := json.Unmarshal([]byte(val), &plan); err != nil {
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+            "error": "Failed to unmarshal plan data",
+            "details": err.Error(),
+        })
+    }
 
-	var plan models.Plan
-	if err := json.Unmarshal([]byte(val), &plan); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error":   "Failed to unmarshal stored plan",
-			"details": err.Error(),
-		})
-	}
+    // Collect all keys to delete
+    keysToDelete := []string{
+        id,                // Main plan
+        id + ":etag",     // Plan's ETag
+    }
 
-	// Delete both the plan and its etag
-	err = config.RedisClient.Del(ctx, id, id+":etag").Err()
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete plan"})
-	}
+    // Add PlanCostShares keys
+    if plan.PlanCostShares != nil {
+        keysToDelete = append(keysToDelete, 
+            plan.PlanCostShares.ObjectId,
+            plan.PlanCostShares.ObjectId + ":etag",
+        )
+    }
 
-	// Publish delete message to RabbitMQ
-	msg := models.PlanMessage{
-		Operation: "delete",
-		Plan:      plan,
-	}
-	rmq := &rabbitmq.Factory{}
-	if err := rmq.PublishMessage("plans_queue", msg); err != nil {
-		log.Printf("Failed to publish delete message: %v", err)
-		// You can return 202 if you want to treat RabbitMQ as async
-	}
-	
-	return c.Status(fiber.StatusNoContent).JSON(fiber.Map{"message": "Plan deleted successfully"})
+    // Add LinkedPlanServices and their child objects
+    for _, service := range plan.LinkedPlanServices {
+        // Add LinkedPlanService keys
+        keysToDelete = append(keysToDelete,
+            service.ObjectId,
+            service.ObjectId + ":etag",
+        )
+
+        // Add LinkedService keys
+        keysToDelete = append(keysToDelete,
+            service.LinkedService.ObjectId,
+            service.LinkedService.ObjectId + ":etag",
+        )
+
+        // Add PlanServiceCostShares keys
+        keysToDelete = append(keysToDelete,
+            service.PlanServiceCostShares.ObjectId,
+            service.PlanServiceCostShares.ObjectId + ":etag",
+        )
+    }
+
+    // Use Redis Pipeline to delete all keys atomically
+    pipe := config.RedisClient.Pipeline()
+    for _, key := range keysToDelete {
+        pipe.Del(ctx, key)
+    }
+
+    // Execute the pipeline
+    if _, err := pipe.Exec(ctx); err != nil {
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+            "error": "Failed to delete plan and its components",
+            "details": err.Error(),
+        })
+    }
+
+    // Publish delete message to RabbitMQ
+    msg := models.PlanMessage{
+        Operation: "delete",
+        Plan:      plan,
+    }
+    rmq := &rabbitmq.Factory{}
+    if err := rmq.PublishMessage("plans_queue", msg); err != nil {
+        log.Printf("Failed to publish delete message: %v", err)
+    }
+
+    return c.Status(fiber.StatusOK).JSON(fiber.Map{
+        "message": "Plan and all related components deleted successfully",
+        "deletedKeys": keysToDelete,
+    })
 }
 
 func PatchPlan(c *fiber.Ctx) error {
@@ -397,7 +436,7 @@ func PatchPlan(c *fiber.Ctx) error {
 		Operation: "patch",
 		Plan:      existingPlan,
 	}
-	
+
 	rmq := &rabbitmq.Factory{}
 	if err := rmq.PublishMessage("plans_queue", msg); err != nil {
 		log.Printf("Failed to publish patch message: %v", err)
